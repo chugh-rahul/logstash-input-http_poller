@@ -54,7 +54,7 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
   private
   def setup_requests!
-    @requests = Hash[@urls.map {|name, url| [name, normalize_request(url)] }]
+    @requests = Hash[@urls.map {|name, url_or_spec| [name, url_or_spec] }]
   end
 
   private
@@ -67,7 +67,10 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
       # method and url aren't really part of the options, so we pull them out
       method = (spec.delete(:method) || :get).to_sym.downcase
-      url = spec.delete(:url)
+
+      url = spec[:url].clone
+      url << "?" << "pageSize=" << spec[:pageSize].to_s << "&" << "page=" << spec[:page].to_s  if spec[:paginated]
+      spec.delete(:url)
 
       # Manticore wants auth options that are like {:auth => {:user => u, :pass => p}}
       # We allow that because earlier versions of this plugin documented that as the main way to
@@ -139,39 +142,46 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   end
 
   def run_once(queue)
-    @requests.each do |name, request|
-      request_async(queue, name, request)
+    @requests.each do |name, url_or_spec|
+      request_async(queue, name, url_or_spec)
     end
+  end
 
+  private
+  def request_async(queue, name, url_or_spec)
+    @logger.debug? && @logger.debug("Fetching URL", :name => name, :url => url_or_spec)
+    started = Time.now
+
+    method, url, *request_opts = normalize_request(url_or_spec)
+    client.async.send(method, url, *request_opts).
+      on_success {|response| handle_success(queue, name, url_or_spec, response, Time.now - started)}.
+      on_failure {|exception|
+      handle_failure(queue, name, url_or_spec, exception, Time.now - started)
+    }
     client.execute!
   end
 
   private
-  def request_async(queue, name, request)
-    @logger.debug? && @logger.debug("Fetching URL", :name => name, :url => request)
-    started = Time.now
-
-    method, *request_opts = request
-    client.async.send(method, *request_opts).
-      on_success {|response| handle_success(queue, name, request, response, Time.now - started)}.
-      on_failure {|exception|
-      handle_failure(queue, name, request, exception, Time.now - started)
-    }
-  end
-
-  private
-  def handle_success(queue, name, request, response, execution_time)
+  def handle_success(queue, name, url_or_spec, response, execution_time)
     body = response.body
     # If there is a usable response. HEAD requests are `nil` and empty get
     # responses come up as "" which will cause the codec to not yield anything
     if body && body.size > 0
       decode_and_flush(@codec, body) do |decoded|
         event = @target ? LogStash::Event.new(@target => decoded.to_hash) : decoded
-        handle_decoded_event(queue, name, request, response, event, execution_time)
+        handle_decoded_event(queue, name, url_or_spec, response, event, execution_time)
+        d = decoded.to_hash
+        if  d['pageInfo'] and ( d['pageInfo']['page'] + 1) *  d['pageInfo']['pageSize'] <  d['pageInfo']['totalCount']
+          if url_or_spec.is_a?(Hash)
+            url_or_spec["page"] = d['pageInfo']['page'] + 1
+            @logger.info("Paginated: next url will be ", :url => url_or_spec)
+            request_async(queue, name, url_or_spec)
+          end
+        end
       end
     else
       event = ::LogStash::Event.new
-      handle_decoded_event(queue, name, request, response, event, execution_time)
+      handle_decoded_event(queue, name, url_or_spec, response, event, execution_time)
     end
   end
 
@@ -182,7 +192,8 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   end
 
   private
-  def handle_decoded_event(queue, name, request, response, event, execution_time)
+  def handle_decoded_event(queue, name, url_or_spec, response, event, execution_time)
+    request=normalize_request(url_or_spec)
     apply_metadata(event, name, request, response, execution_time)
     decorate(event)
     queue << event
@@ -198,7 +209,8 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
   private
   # Beware, on old versions of manticore some uncommon failures are not handled
-  def handle_failure(queue, name, request, exception, execution_time)
+  def handle_failure(queue, name, url_or_spec, exception, execution_time)
+    request=normalize_request(url_or_spec)
     event = LogStash::Event.new
     apply_metadata(event, name, request)
 

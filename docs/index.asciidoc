@@ -44,6 +44,9 @@ input {
         headers => {
           Accept => "application/json"
         }
+        paginated => true
+        pageSize => 10
+        page => 0
      }
     }
     request_timeout => 60
@@ -85,6 +88,24 @@ The above snippet will create two files `downloaded_cert.pem` and `downloaded_tr
    schedule => { cron => "* * * * * UTC"}
  }
 ----------------------------------
+
+Using the HTTP poller with pagination support.
+
+If you have a server which supports pagination and you want to pull all the records without overwhelming the server, you can use the paginated response. Use parameters `pageSize`, `paginated`, `page` to provide the configurations you would like to set. 
+
+The above will add `?pageSize=X&page=Y` in the URL and keeps incrementing `page` by `1` until it hits the total records.
+
+The response is expected to have the following json in the output
+
+[source,json]
+----------------------------------
+ "pageInfo": { 
+   "page": Y,
+   "pageSize": X,
+   "totalCount": T  
+ }
+----------------------------------
+ 
 
 
 [id="plugins-{type}s-{plugin}-options"]
